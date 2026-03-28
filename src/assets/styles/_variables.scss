@@ -1,0 +1,39 @@
+// Couleurs du drapeau ivoirien
+$ci-orange: #FF8C00;
+$ci-orange-light: #FFa040;
+$ci-green: #009E49;
+$ci-white: #FFFFFF;
+
+// Couleurs de fond (theme sombre)
+$dark-bg: #0A0A0E;
+$surface: #131318;
+$card: #1A1A22;
+$card-hover: #22222C;
+$border: #2A2A35;
+
+// Couleurs de texte
+$text-primary: #F0EDE6;
+$text-secondary: #777;
+$text-dim: #444;
+
+// Couleurs d'action
+$danger: #E74C3C;
+
+// Typographie
+$font-family: 'DM Sans', sans-serif;
+
+// Rayons de bordure
+$radius-sm: 6px;
+$radius-md: 10px;
+$radius-lg: 14px;
+$radius-xl: 16px;
+$radius-2xl: 20px;
+
+// Transitions
+$transition-fast: 0.2s ease;
+$transition-normal: 0.3s ease;
+
+// Breakpoints responsive
+$bp-mobile: 480px;
+$bp-tablet: 768px;
+$bp-desktop: 1024px;
