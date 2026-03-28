@@ -75,6 +75,7 @@ import { useUserStore } from '@/stores/user'
 import { useCallTimer } from '@/composables/useCallTimer'
 import { useMediaStream } from '@/composables/useMediaStream'
 import { useVoiceDetection } from '@/composables/useVoiceDetection'
+import { useNotificationSound } from '@/composables/useNotificationSound'
 import RoomHeader from '@/components/room/RoomHeader.vue'
 import VideoGrid from '@/components/room/VideoGrid.vue'
 import SpeakerView from '@/components/room/SpeakerView.vue'
@@ -92,6 +93,7 @@ const userStore = useUserStore()
 const callTimer = useCallTimer()
 const media = useMediaStream()
 const voiceDetection = useVoiceDetection()
+const notifSound = useNotificationSound()
 
 const isSidePanelOpen = ref(true)
 const activeTab = ref('chat')
@@ -162,7 +164,25 @@ onMounted(async () => {
   }, 200)
 })
 
+// --- Raccourcis clavier ---
+function handleKeydown(e) {
+  // Ignorer si on tape dans un input
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return
+
+  switch (e.key.toLowerCase()) {
+    case 'm': handleToggleMute(); break
+    case 'v': handleToggleCamera(); break
+    case 'e': handleToggleScreen(); break
+    case 'c': toggleChat(); break
+    case 'p': toggleParticipants(); break
+    case 'escape': leaveRoom(); break
+  }
+}
+
+window.addEventListener('keydown', handleKeydown)
+
 onUnmounted(() => {
+  window.removeEventListener('keydown', handleKeydown)
   callTimer.stop()
   voiceDetection.stop()
   media.stopMedia()
@@ -220,6 +240,7 @@ function handleSendMessage(content) {
     senderName: userStore.username,
     content
   })
+  notifSound.playMessage()
 }
 
 function toggleChat() {

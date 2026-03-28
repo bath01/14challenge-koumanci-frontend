@@ -5,7 +5,11 @@
       <span class="room-header__logo">
         Kouman<span class="room-header__logo--accent">CI</span>
       </span>
-      <span class="room-header__code">{{ roomCode }}</span>
+      <button class="room-header__code" @click="copyCode">
+        {{ roomCode }}
+        <Check v-if="copied" :size="10" />
+        <Copy v-else :size="10" />
+      </button>
     </div>
 
     <div class="room-header__right">
@@ -42,10 +46,11 @@
 </template>
 
 <script setup>
-import { Users, LayoutGrid, MonitorSpeaker } from 'lucide-vue-next'
+import { ref } from 'vue'
+import { Users, LayoutGrid, MonitorSpeaker, Copy, Check } from 'lucide-vue-next'
 import FlagBar from '@/components/common/FlagBar.vue'
 
-defineProps({
+const props = defineProps({
   roomCode: { type: String, required: true },
   duration: { type: String, default: '00:00' },
   participantCount: { type: Number, default: 0 },
@@ -53,6 +58,14 @@ defineProps({
 })
 
 defineEmits(['set-view'])
+
+const copied = ref(false)
+
+function copyCode() {
+  navigator.clipboard.writeText(props.roomCode)
+  copied.value = true
+  setTimeout(() => { copied.value = false }, 2000)
+}
 </script>
 
 <style scoped lang="scss">
@@ -89,8 +102,18 @@ defineEmits(['set-view'])
     padding: 3px 10px;
     border-radius: $radius-sm;
     background: rgba($ci-orange, 0.08);
+    border: 1px solid rgba($ci-orange, 0.15);
     color: $ci-orange;
     font-weight: 600;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    cursor: pointer;
+    transition: all $transition-fast;
+
+    &:hover {
+      background: rgba($ci-orange, 0.15);
+    }
   }
 
   &__right {

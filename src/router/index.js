@@ -9,6 +9,12 @@ const router = createRouter({
       component: () => import('@/views/HomeView.vue')
     },
     {
+      path: '/prejoin/:code',
+      name: 'prejoin',
+      component: () => import('@/views/PreJoinView.vue'),
+      props: true
+    },
+    {
       path: '/room/:code',
       name: 'room',
       component: () => import('@/views/RoomView.vue'),

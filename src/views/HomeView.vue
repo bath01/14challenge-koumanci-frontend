@@ -142,7 +142,7 @@ function createRoom() {
   if (!username.value.trim()) return
   userStore.setUsername(username.value.trim())
   const code = generateRoomCode()
-  router.push({ name: 'room', params: { code } })
+  router.push({ name: 'prejoin', params: { code } })
 }
 
 function joinRoom() {
@@ -154,7 +154,7 @@ function joinRoom() {
 function handleJoinRecent(code) {
   if (!username.value.trim()) return
   userStore.setUsername(username.value.trim())
-  router.push({ name: 'room', params: { code } })
+  router.push({ name: 'prejoin', params: { code } })
 }
 
 function triggerFileInput() {
