@@ -13,8 +13,9 @@ export default defineConfig({
     port: 5173,
     proxy: {
       '/api': {
-        target: 'http://localhost:3333',
-        changeOrigin: true
+        target: 'https://api.koumanci.chalenge14.com',
+        changeOrigin: true,
+        secure: true
       }
     }
   }

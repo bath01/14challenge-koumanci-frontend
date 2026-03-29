@@ -12,6 +12,19 @@
         Visioconference peer-to-peer — Parle, partage, collabore
       </p>
 
+      <!-- Barre utilisateur connecte -->
+      <div class="home__user-bar">
+        <span class="home__user-greeting">Salut, {{ authStore.user?.fullName || username || 'toi' }}</span>
+        <div class="home__user-actions">
+          <router-link to="/profile" class="home__user-link">
+            <UserIcon :size="14" /> Profil
+          </router-link>
+          <button class="home__user-logout" @click="handleLogout">
+            <LogOut :size="14" /> Quitter
+          </button>
+        </div>
+      </div>
+
       <!-- Photo de profil -->
       <div class="home__avatar-section">
         <div
@@ -56,8 +69,10 @@
       </div>
 
       <!-- Creer une room -->
-      <button class="home__btn-create" @click="createRoom">
-        <Video :size="18" /> Creer une reunion
+      <button class="home__btn-create" @click="createRoom" :disabled="creatingRoom">
+        <Loader2 v-if="creatingRoom" :size="18" class="home__spinner" />
+        <Video v-else :size="18" />
+        {{ creatingRoom ? 'Creation...' : 'Creer une reunion' }}
       </button>
 
       <!-- Separateur -->
@@ -104,45 +119,78 @@
 <script setup>
 import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
-import { Video, LogIn, Info, Camera, X } from 'lucide-vue-next'
+import { Video, LogIn, Info, Camera, X, User as UserIcon, LogOut, Loader2 } from 'lucide-vue-next'
 import { useGradient } from '@/composables/useGradient'
 import { useUserStore } from '@/stores/user'
+import { useAuthStore } from '@/stores/auth'
+import { roomApi } from '@/services/api'
 import FlagBar from '@/components/common/FlagBar.vue'
 import RecentRooms from '@/components/home/RecentRooms.vue'
 
 const router = useRouter()
 const userStore = useUserStore()
+const authStore = useAuthStore()
 const { generateGradient } = useGradient()
 
 const username = ref(userStore.username)
 const avatarUrl = ref(userStore.avatarUrl)
 const joinCode = ref('')
 const fileInput = ref(null)
+const creatingRoom = ref(false)
 
 const avatarGradient = 'linear-gradient(135deg, #FF8C00, #009E49)'
 
-// Donnees fictives de reunions recentes (sera remplace par l'API)
-const recentRooms = ref([
-  { code: 'ABI-2026', name: 'Sprint Review J12', participants: 6, date: '27 Mars' },
-  { code: 'CIV-1414', name: 'Daily Challenge', participants: 3, date: '26 Mars' },
-  { code: 'YAM-0315', name: 'Planning Semaine 3', participants: 4, date: '25 Mars' }
-])
+// Reunions recentes chargees depuis l'API
+const recentRooms = ref([])
 
-onMounted(() => {
-  if (userStore.username) {
+onMounted(async () => {
+  // Charger le profil si pas encore fait
+  if (!authStore.user) {
+    await authStore.fetchProfile()
+  }
+  if (authStore.user?.fullName) {
+    username.value = authStore.user.fullName
+  } else if (userStore.username) {
     username.value = userStore.username
   }
+
+  // Charger la liste des rooms depuis l'API
+  await loadRooms()
 })
 
-function generateRoomCode() {
-  return `KCI-${Math.random().toString(36).substring(2, 6).toUpperCase()}`
+async function loadRooms() {
+  try {
+    const rooms = await roomApi.list()
+    // Adapter le format pour le composant RecentRooms
+    recentRooms.value = (rooms.data || rooms || []).map(room => ({
+      code: room.code,
+      name: room.name || 'Sans nom',
+      participants: room.participantCount || room.participants?.length || 0,
+      date: new Date(room.createdAt).toLocaleDateString('fr-FR', { day: 'numeric', month: 'short' })
+    }))
+  } catch {
+    // Si erreur, afficher une liste vide
+    recentRooms.value = []
+  }
 }
 
-function createRoom() {
-  if (!username.value.trim()) return
+async function createRoom() {
+  if (!username.value.trim() || creatingRoom.value) return
   userStore.setUsername(username.value.trim())
-  const code = generateRoomCode()
-  router.push({ name: 'prejoin', params: { code } })
+  creatingRoom.value = true
+  try {
+    const room = await roomApi.create({
+      name: `Reunion de ${username.value.trim()}`,
+      isPrivate: false,
+      maxParticipants: 20
+    })
+    const code = room.code || room.data?.code
+    router.push({ name: 'prejoin', params: { code } })
+  } catch (err) {
+    alert(err.message || 'Impossible de creer la reunion')
+  } finally {
+    creatingRoom.value = false
+  }
 }
 
 function joinRoom() {
@@ -197,6 +245,11 @@ function removeAvatar() {
   avatarUrl.value = ''
   userStore.removeAvatar()
 }
+
+async function handleLogout() {
+  await authStore.logout()
+  router.push({ name: 'login' })
+}
 </script>
 
 <style scoped lang="scss">
@@ -237,7 +290,71 @@ function removeAvatar() {
   &__subtitle {
     font-size: 15px;
     color: $text-secondary;
-    margin: 0 0 40px;
+    margin: 0 0 16px;
+  }
+
+  &__user-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: $card;
+    border: 1px solid $border;
+    border-radius: $radius-md;
+    padding: 10px 16px;
+    margin-bottom: 28px;
+  }
+
+  &__user-greeting {
+    font-size: 13px;
+    color: $text-secondary;
+    font-weight: 500;
+  }
+
+  &__user-actions {
+    display: flex;
+    gap: 8px;
+  }
+
+  &__user-link {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 6px 12px;
+    border-radius: $radius-sm;
+    border: 1px solid $border;
+    background: transparent;
+    color: $text-secondary;
+    font-size: 11px;
+    text-decoration: none;
+    transition: all $transition-fast;
+
+    &:hover {
+      border-color: $ci-orange;
+      color: $ci-orange;
+    }
+  }
+
+  &__user-logout {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 6px 12px;
+    border-radius: $radius-sm;
+    border: 1px solid rgba($danger, 0.3);
+    background: transparent;
+    color: $danger;
+    font-size: 11px;
+    cursor: pointer;
+    transition: all $transition-fast;
+
+    &:hover {
+      border-color: $danger;
+      background: rgba($danger, 0.08);
+    }
+  }
+
+  &__spinner {
+    animation: spin 1s linear infinite;
   }
 
   &__avatar-section {
@@ -450,6 +567,11 @@ function removeAvatar() {
       color: $ci-orange;
     }
   }
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
 }
 
 // --- Responsive ---

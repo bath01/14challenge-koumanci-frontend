@@ -18,7 +18,7 @@
           :participants="roomStore.participants"
           :columns="roomStore.gridColumns"
           :streams="videoStreams"
-          :local-user-id="1"
+          :local-user-id="localUserId"
         />
         <SpeakerView
           v-else
@@ -26,7 +26,7 @@
           :pinned-id="roomStore.pinnedParticipantId"
           :active-speaker="roomStore.activeSpeaker"
           :streams="videoStreams"
-          :local-user-id="1"
+          :local-user-id="localUserId"
           @pin="roomStore.pinParticipant"
         />
       </div>
@@ -38,7 +38,7 @@
         :messages="chatStore.messages"
         :participants="roomStore.participants"
         :participant-count="roomStore.participants.length"
-        :current-user-id="1"
+        :current-user-id="localUserId"
         :current-user-avatar-url="userStore.avatarUrl"
         @set-tab="setActiveTab"
         @send-message="handleSendMessage"
@@ -76,6 +76,8 @@ import { useCallTimer } from '@/composables/useCallTimer'
 import { useMediaStream } from '@/composables/useMediaStream'
 import { useVoiceDetection } from '@/composables/useVoiceDetection'
 import { useNotificationSound } from '@/composables/useNotificationSound'
+import { useAuthStore } from '@/stores/auth'
+import { roomApi, participantApi } from '@/services/api'
 import RoomHeader from '@/components/room/RoomHeader.vue'
 import VideoGrid from '@/components/room/VideoGrid.vue'
 import SpeakerView from '@/components/room/SpeakerView.vue'
@@ -93,6 +95,7 @@ const userStore = useUserStore()
 const callTimer = useCallTimer()
 const media = useMediaStream()
 const voiceDetection = useVoiceDetection()
+const authStore = useAuthStore()
 const notifSound = useNotificationSound()
 
 const isSidePanelOpen = ref(true)
@@ -100,26 +103,8 @@ const activeTab = ref('chat')
 // Map participantId -> MediaStream pour les flux video
 const videoStreams = reactive({})
 let speakingInterval = null
-
-// Donnees fictives pour la demo (sera remplace par WebSocket)
-const mockParticipants = [
-  { id: 1, username: userStore.username || 'Bath Dorgeles', avatar: 'BD', avatarUrl: userStore.avatarUrl || '', isHost: true, isMuted: false, isCameraOff: false, isScreenSharing: false, isSpeaking: true },
-  { id: 2, username: 'Oclin Marcel C.', avatar: 'MC', isHost: false, isMuted: false, isCameraOff: false, isScreenSharing: false, isSpeaking: false },
-  { id: 3, username: 'Rayane Irie', avatar: 'RI', isHost: false, isMuted: true, isCameraOff: false, isScreenSharing: false, isSpeaking: false },
-  { id: 4, username: 'Fatou Diallo', avatar: 'FD', isHost: false, isMuted: false, isCameraOff: true, isScreenSharing: false, isSpeaking: false },
-  { id: 5, username: 'Konan Affoue', avatar: 'KA', isHost: false, isMuted: true, isCameraOff: false, isScreenSharing: false, isSpeaking: false },
-  { id: 6, username: 'Moussa Toure', avatar: 'MT', isHost: false, isMuted: false, isCameraOff: false, isScreenSharing: false, isSpeaking: false }
-]
-
-const mockMessages = [
-  { id: 1, senderId: 1, senderName: userStore.username || 'Bath Dorgeles', content: 'Bienvenue a tous dans la reunion ! 👋', timestamp: '14:00' },
-  { id: 2, senderId: 2, senderName: 'Oclin Marcel C.', content: 'Salut Bath ! On est la 💪', timestamp: '14:01' },
-  { id: 3, senderId: 3, senderName: 'Rayane Irie', content: 'Le back-end est pret, on peut commencer la demo', timestamp: '14:02' },
-  { id: 4, senderId: 4, senderName: 'Fatou Diallo', content: 'Ma camera a un souci, je reste en audio pour l\'instant', timestamp: '14:03' },
-  { id: 5, senderId: 1, senderName: userStore.username || 'Bath Dorgeles', content: 'Pas de probleme Fatou. On commence le point sur les projets difficiles', timestamp: '14:04' },
-  { id: 6, senderId: 5, senderName: 'Konan Affoue', content: 'J\'ai une question sur PistCI, je la pose apres la demo', timestamp: '14:05' },
-  { id: 7, senderId: 6, senderName: 'Moussa Toure', content: 'IvorioCI avance bien, le streaming HLS fonctionne 🎬', timestamp: '14:06' }
-]
+// ID de l'utilisateur local (depuis le profil auth)
+const localUserId = ref(authStore.user?.id || 1)
 
 onMounted(async () => {
   // Rediriger vers home si pas de nom d'utilisateur
@@ -128,15 +113,56 @@ onMounted(async () => {
     return
   }
 
-  // Initialiser la room avec les donnees fictives
-  roomStore.setRoomInfo({ id: 1, code: props.code, name: '', hostId: 1 })
-  mockParticipants.forEach(p => roomStore.addParticipant(p))
-  mockMessages.forEach(m => chatStore.addMessage(m))
+  // Charger les infos de la room depuis l'API
+  try {
+    const room = await roomApi.getByCode(props.code)
+    roomStore.setRoomInfo({
+      id: room.id,
+      code: room.code || props.code,
+      name: room.name || '',
+      hostId: room.hostId || room.creatorId
+    })
+  } catch {
+    // Fallback si la room n'est pas trouvee
+    roomStore.setRoomInfo({ id: null, code: props.code, name: '', hostId: localUserId.value })
+  }
+
+  // Charger les participants depuis l'API
+  try {
+    const participants = await participantApi.list(props.code)
+    const participantList = participants.data || participants || []
+    participantList.forEach(p => {
+      roomStore.addParticipant({
+        id: p.userId || p.id,
+        username: p.fullName || p.username || 'Participant',
+        avatar: (p.fullName || p.username || 'P').split(' ').map(w => w[0]).slice(0, 2).join('').toUpperCase(),
+        avatarUrl: p.avatarUrl || '',
+        isHost: p.role === 'host',
+        isMuted: false,
+        isCameraOff: !p.canPublishVideo,
+        isScreenSharing: false,
+        isSpeaking: false
+      })
+    })
+  } catch {
+    // Ajouter au moins l'utilisateur local comme participant
+    roomStore.addParticipant({
+      id: localUserId.value,
+      username: userStore.username,
+      avatar: userStore.getInitials(),
+      avatarUrl: userStore.avatarUrl || '',
+      isHost: true,
+      isMuted: false,
+      isCameraOff: false,
+      isScreenSharing: false,
+      isSpeaking: false
+    })
+  }
 
   // Demarrer la camera et le micro de l'utilisateur local
   const stream = await media.startMedia()
   if (stream) {
-    videoStreams[1] = stream
+    videoStreams[localUserId.value] = stream
     roomStore.isCameraOff = media.isCameraOff.value
     roomStore.isMuted = media.isMuted.value
     // Demarrer la detection vocale sur le flux local
@@ -146,20 +172,10 @@ onMounted(async () => {
   // Demarrer le timer
   callTimer.start()
 
-  // Mettre a jour l'indicateur de parole du user local via la detection vocale
-  // + simulation aleatoire pour les autres participants (sera remplace par WebRTC)
+  // Mettre a jour l'indicateur de parole
   speakingInterval = setInterval(() => {
-    // Utilisateur local : detection reelle
-    roomStore.updateParticipant(1, {
+    roomStore.updateParticipant(localUserId.value, {
       isSpeaking: !roomStore.isMuted && voiceDetection.isSpeaking.value
-    })
-    // Autres participants : simulation (sera remplace par les streams distants)
-    roomStore.participants.forEach(p => {
-      if (p.id !== 1) {
-        roomStore.updateParticipant(p.id, {
-          isSpeaking: !p.isMuted && Math.random() > 0.7
-        })
-      }
     })
   }, 200)
 })
@@ -181,12 +197,14 @@ function handleKeydown(e) {
 
 window.addEventListener('keydown', handleKeydown)
 
-onUnmounted(() => {
+onUnmounted(async () => {
   window.removeEventListener('keydown', handleKeydown)
   callTimer.stop()
   voiceDetection.stop()
   media.stopMedia()
   if (speakingInterval) clearInterval(speakingInterval)
+  // Notifier le backend qu'on quitte la room
+  try { await roomApi.leave(props.code) } catch { /* ignore */ }
   roomStore.resetRoom()
   chatStore.clearMessages()
 })
@@ -194,13 +212,13 @@ onUnmounted(() => {
 function handleToggleMute() {
   media.toggleMute()
   roomStore.isMuted = media.isMuted.value
-  roomStore.updateParticipant(1, { isMuted: media.isMuted.value })
+  roomStore.updateParticipant(localUserId.value, { isMuted: media.isMuted.value })
 }
 
 async function handleToggleCamera() {
   await media.toggleCamera()
   roomStore.isCameraOff = media.isCameraOff.value
-  roomStore.updateParticipant(1, { isCameraOff: media.isCameraOff.value })
+  roomStore.updateParticipant(localUserId.value, { isCameraOff: media.isCameraOff.value })
 }
 
 async function handleToggleScreen() {
@@ -208,24 +226,24 @@ async function handleToggleScreen() {
   isSidePanelOpen.value = false
   const stream = await media.toggleScreenSharing()
   roomStore.isScreenSharing = media.isScreenSharing.value
-  roomStore.updateParticipant(1, { isScreenSharing: media.isScreenSharing.value })
+  roomStore.updateParticipant(localUserId.value, { isScreenSharing: media.isScreenSharing.value })
 
   if (stream) {
     // Afficher le partage d'ecran dans la tuile de l'utilisateur
-    videoStreams[1] = stream
+    videoStreams[localUserId.value] = stream
     // Quand le partage s'arrete (via navigateur), revenir a la camera
     stream.getVideoTracks()[0].addEventListener('ended', () => {
       roomStore.isScreenSharing = false
-      roomStore.updateParticipant(1, { isScreenSharing: false })
+      roomStore.updateParticipant(localUserId.value, { isScreenSharing: false })
       // Restaurer le flux camera si elle n'est pas coupee
       if (media.localStream.value && !media.isCameraOff.value) {
-        videoStreams[1] = media.localStream.value
+        videoStreams[localUserId.value] = media.localStream.value
       }
     })
   } else {
     // Partage arrete, restaurer le flux camera
     if (media.localStream.value && !media.isCameraOff.value) {
-      videoStreams[1] = media.localStream.value
+      videoStreams[localUserId.value] = media.localStream.value
     }
   }
 }
@@ -236,7 +254,7 @@ function handleSetView(mode) {
 
 function handleSendMessage(content) {
   chatStore.addMessage({
-    senderId: 1,
+    senderId: localUserId.value,
     senderName: userStore.username,
     content
   })

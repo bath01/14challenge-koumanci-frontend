@@ -82,8 +82,13 @@
 
       <!-- Boutons -->
       <div class="prejoin__actions">
-        <button class="prejoin__btn-join" @click="joinRoom" :disabled="!username.trim()">
-          <LogIn :size="18" /> Rejoindre la reunion
+        <!-- Erreur -->
+        <div v-if="errorMsg" class="prejoin__error">{{ errorMsg }}</div>
+
+        <button class="prejoin__btn-join" @click="joinRoom" :disabled="!username.trim() || joining">
+          <Loader2 v-if="joining" :size="18" class="prejoin__spinner" />
+          <LogIn v-else :size="18" />
+          {{ joining ? 'Connexion...' : 'Rejoindre la reunion' }}
         </button>
         <button class="prejoin__btn-back" @click="goBack">
           <ArrowLeft :size="14" /> Retour
@@ -98,11 +103,13 @@ import { ref, onMounted, onUnmounted, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import {
   Mic, MicOff, Video, VideoOff,
-  LogIn, ArrowLeft, Copy, Check
+  LogIn, ArrowLeft, Copy, Check, Loader2
 } from 'lucide-vue-next'
 import { useUserStore } from '@/stores/user'
+import { useAuthStore } from '@/stores/auth'
 import { useMediaStream } from '@/composables/useMediaStream'
 import { useVoiceDetection } from '@/composables/useVoiceDetection'
+import { roomApi } from '@/services/api'
 import FlagBar from '@/components/common/FlagBar.vue'
 
 const props = defineProps({
@@ -111,12 +118,16 @@ const props = defineProps({
 
 const router = useRouter()
 const userStore = useUserStore()
+const authStore = useAuthStore()
 const media = useMediaStream()
 const voiceDetection = useVoiceDetection()
 
 const username = ref(userStore.username)
 const videoEl = ref(null)
 const copied = ref(false)
+const joining = ref(false)
+const roomInfo = ref(null)
+const errorMsg = ref('')
 const avatarGradient = 'linear-gradient(135deg, #FF8C00, #009E49)'
 
 onMounted(async () => {
@@ -124,6 +135,14 @@ onMounted(async () => {
     router.push({ name: 'home' })
     return
   }
+
+  // Charger les infos de la room depuis l'API
+  try {
+    roomInfo.value = await roomApi.getByCode(props.code)
+  } catch {
+    // La room n'existe peut-etre pas encore (creation en cours)
+  }
+
   const stream = await media.startMedia()
   if (stream) {
     voiceDetection.start(stream)
@@ -160,13 +179,23 @@ function copyCode() {
   setTimeout(() => { copied.value = false }, 2000)
 }
 
-function joinRoom() {
-  if (!username.value.trim()) return
+async function joinRoom() {
+  if (!username.value.trim() || joining.value) return
   userStore.setUsername(username.value.trim())
-  // Stopper les streams ici, RoomView les redemarre
-  voiceDetection.stop()
-  media.stopMedia()
-  router.push({ name: 'room', params: { code: props.code } })
+  joining.value = true
+  errorMsg.value = ''
+
+  try {
+    // Appeler l'API pour rejoindre la room
+    await roomApi.join(props.code)
+    // Stopper les streams ici, RoomView les redemarre
+    voiceDetection.stop()
+    media.stopMedia()
+    router.push({ name: 'room', params: { code: props.code } })
+  } catch (err) {
+    errorMsg.value = err.message || 'Impossible de rejoindre la reunion'
+    joining.value = false
+  }
 }
 
 function goBack() {
@@ -390,6 +419,20 @@ function goBack() {
     display: flex;
     flex-direction: column;
     gap: 10px;
+  }
+
+  &__error {
+    text-align: center;
+    padding: 10px 16px;
+    border-radius: $radius-md;
+    background: rgba($danger, 0.1);
+    border: 1px solid rgba($danger, 0.25);
+    color: $danger;
+    font-size: 12px;
+  }
+
+  &__spinner {
+    animation: spin 1s linear infinite;
   }
 
   &__btn-join {
