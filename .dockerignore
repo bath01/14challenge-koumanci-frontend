@@ -3,4 +3,4 @@ dist
 .DS_Store
 .git
 *.md
-.env*
+.env.local
