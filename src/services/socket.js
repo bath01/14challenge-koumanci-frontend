@@ -28,6 +28,8 @@ async function sendToServer(endpoint, data = {}) {
   })
 
   if (!response.ok) {
+    // Ignorer silencieusement les 404 (endpoint pas encore cree cote backend)
+    if (response.status === 404) return null
     const body = await response.json().catch(() => ({}))
     throw new Error(body.errors?.[0]?.message || body.message || 'Erreur serveur')
   }
@@ -96,10 +98,11 @@ export class SignalingService {
 
   /**
    * Envoie un message au serveur via REST
+   * Silencieux si l'endpoint n'existe pas encore cote backend
    */
   send(type, payload) {
     if (!this.roomCode) return
-    return sendToServer(`/rooms/${this.roomCode}/signal`, { type, payload })
+    return sendToServer(`/rooms/${this.roomCode}/signal`, { type, payload }).catch(() => {})
   }
 
   /**
@@ -151,7 +154,7 @@ export class SignalingService {
   // --- Chat (envoi via REST) ---
 
   sendChatMessage(content) {
-    return sendToServer(`/rooms/${this.roomCode}/chat`, { content })
+    return sendToServer(`/rooms/${this.roomCode}/chat`, { content }).catch(() => {})
   }
 
   sendTyping() {

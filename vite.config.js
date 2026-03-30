@@ -16,6 +16,11 @@ export default defineConfig({
         target: 'https://api.koumanci.chalenge14.com',
         changeOrigin: true,
         secure: true
+      },
+      '/__transmit': {
+        target: 'https://api.koumanci.chalenge14.com',
+        changeOrigin: true,
+        secure: true
       }
     }
   }

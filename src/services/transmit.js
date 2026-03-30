@@ -2,8 +2,6 @@
 // Utilise @adonisjs/transmit-client pour recevoir les evenements de room, chat, participants
 import { Transmit } from '@adonisjs/transmit-client'
 
-const API_BASE = import.meta.env.VITE_API_URL?.replace('/api/v1', '') || ''
-
 let transmitInstance = null
 const subscriptions = new Map()
 
@@ -16,12 +14,13 @@ function getAuthToken() {
 
 /**
  * Cree et retourne l'instance Transmit singleton
+ * Le baseUrl pointe vers la meme origine car nginx/vite proxy /__transmit/ vers le backend
  */
 export function getTransmit() {
   if (transmitInstance) return transmitInstance
 
   transmitInstance = new Transmit({
-    baseUrl: API_BASE || window.location.origin,
+    baseUrl: window.location.origin,
 
     // Ajouter le token d'auth a chaque requete de souscription
     beforeSubscribe(request) {

@@ -164,10 +164,12 @@ onMounted(async () => {
   }
 
   // 4. Connecter Transmit (SSE) pour recevoir les evenements temps reel
-  await initSignaling()
+  // Non bloquant : si Transmit n'est pas configure, le polling prend le relais
+  initSignaling().catch(() => {})
 
   // 5. Initialiser mediasoup (WebRTC SFU) pour le streaming
-  await initMediasoup(stream)
+  // Non bloquant : si mediasoup n'est pas pret, le polling des producers prend le relais
+  initMediasoup(stream).catch(() => {})
 
   // 6. Demarrer le timer d'appel
   callTimer.start()
