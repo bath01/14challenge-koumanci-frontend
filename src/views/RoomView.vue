@@ -113,8 +113,11 @@ const activeTab = ref('chat')
 const videoStreams = reactive({})
 let speakingInterval = null
 let participantPollingInterval = null
+let producerPollingInterval = null
 // ID de l'utilisateur local (depuis le profil auth)
 const localUserId = ref(authStore.user?.id || 1)
+// Set des producers deja consommes pour eviter les doublons
+const consumedProducerIds = new Set()
 // Toast de notification
 const toastMessage = ref('')
 let toastTimeout = null
@@ -127,7 +130,14 @@ onMounted(async () => {
     return
   }
 
-  // 1. Charger les infos de la room depuis l'API
+  // 1. S'assurer qu'on est bien enregistre dans la room cote backend
+  try {
+    await roomApi.join(props.code)
+  } catch {
+    // Peut echouer si deja rejoint, on ignore
+  }
+
+  // 2. Charger les infos de la room depuis l'API
   try {
     const response = await roomApi.getByCode(props.code)
     const room = response.data || response
@@ -141,7 +151,7 @@ onMounted(async () => {
     roomStore.setRoomInfo({ id: null, code: props.code, name: '', hostId: localUserId.value })
   }
 
-  // 2. Charger les participants depuis l'API
+  // 3. Charger les participants depuis l'API
   await refreshParticipants(false)
 
   // 3. Demarrer la camera et le micro de l'utilisateur local
@@ -172,6 +182,11 @@ onMounted(async () => {
   // 8. Polling des participants toutes les 5s (fallback si Transmit non disponible)
   participantPollingInterval = setInterval(() => {
     refreshParticipants(true)
+  }, 5000)
+
+  // 9. Polling des producers toutes les 5s pour consommer les nouveaux flux distants
+  producerPollingInterval = setInterval(() => {
+    pollRemoteProducers()
   }, 5000)
 })
 
@@ -244,7 +259,7 @@ async function refreshParticipants(notify) {
         username: userStore.username,
         avatar: userStore.getInitials(),
         avatarUrl: userStore.avatarUrl || '',
-        isHost: true,
+        isHost: roomStore.hostId === localUserId.value,
         isMuted: false,
         isCameraOff: false,
         isScreenSharing: false,
@@ -259,7 +274,7 @@ async function refreshParticipants(notify) {
         username: userStore.username,
         avatar: userStore.getInitials(),
         avatarUrl: userStore.avatarUrl || '',
-        isHost: true,
+        isHost: roomStore.hostId === localUserId.value,
         isMuted: false,
         isCameraOff: false,
         isScreenSharing: false,
@@ -377,15 +392,29 @@ async function initMediasoup(localStream) {
 
 // --- Consommer les producers existants dans la room ---
 async function consumeExistingProducers() {
+  await pollRemoteProducers()
+}
+
+/**
+ * Polle les producers distants et consomme ceux qu'on n'a pas encore consommes
+ */
+async function pollRemoteProducers() {
   try {
     const response = await import('@/services/api').then(m => m.rtcApi.getProducers(props.code))
     const producerList = response.data || response || []
 
     for (const producer of producerList) {
-      await consumeRemoteProducer(producer.id || producer.producerId, producer.userId)
+      const producerId = producer.id || producer.producerId
+      // Ignorer les producers deja consommes
+      if (consumedProducerIds.has(producerId)) continue
+      // Ignorer nos propres producers
+      if (producer.userId === localUserId.value) continue
+
+      consumedProducerIds.add(producerId)
+      await consumeRemoteProducer(producerId, producer.userId)
     }
-  } catch (err) {
-    console.warn('[Room] Erreur chargement producers:', err.message)
+  } catch {
+    // Silencieux — le polling reessaiera
   }
 }
 
@@ -436,6 +465,7 @@ onUnmounted(async () => {
   media.stopMedia()
   if (speakingInterval) clearInterval(speakingInterval)
   if (participantPollingInterval) clearInterval(participantPollingInterval)
+  if (producerPollingInterval) clearInterval(producerPollingInterval)
   if (toastTimeout) clearTimeout(toastTimeout)
   // Nettoyer mediasoup (fermer transports, producers, consumers)
   mediasoup.cleanup()
