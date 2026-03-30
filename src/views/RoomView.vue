@@ -1,5 +1,12 @@
 <template>
   <div class="room">
+    <!-- Toast notification -->
+    <Transition name="toast">
+      <div v-if="toastMessage" class="room__toast">
+        {{ toastMessage }}
+      </div>
+    </Transition>
+
     <!-- Header -->
     <RoomHeader
       :room-code="code"
@@ -105,8 +112,12 @@ const activeTab = ref('chat')
 // Map participantId -> MediaStream pour les flux video
 const videoStreams = reactive({})
 let speakingInterval = null
+let participantPollingInterval = null
 // ID de l'utilisateur local (depuis le profil auth)
 const localUserId = ref(authStore.user?.id || 1)
+// Toast de notification
+const toastMessage = ref('')
+let toastTimeout = null
 
 // --- Initialisation de la room ---
 onMounted(async () => {
@@ -131,44 +142,7 @@ onMounted(async () => {
   }
 
   // 2. Charger les participants depuis l'API
-  let localParticipantFound = false
-  try {
-    const response = await participantApi.list(props.code)
-    const participantList = response.data || response || []
-    participantList.forEach(p => {
-      const pId = p.userId || p.id
-      const pName = p.user?.fullName || p.fullName || p.username || 'Participant'
-      if (pId === localUserId.value) localParticipantFound = true
-      roomStore.addParticipant({
-        id: pId,
-        username: pId === localUserId.value ? userStore.username : pName,
-        avatar: (pName).split(' ').map(w => w[0]).slice(0, 2).join('').toUpperCase(),
-        avatarUrl: pId === localUserId.value ? (userStore.avatarUrl || '') : (p.avatarUrl || ''),
-        isHost: p.role === 'host',
-        isMuted: false,
-        isCameraOff: false,
-        isScreenSharing: false,
-        isSpeaking: false
-      })
-    })
-  } catch {
-    // Erreur API, on continue sans les participants distants
-  }
-
-  // Toujours s'assurer que l'utilisateur local est dans la liste des participants
-  if (!localParticipantFound) {
-    roomStore.addParticipant({
-      id: localUserId.value,
-      username: userStore.username,
-      avatar: userStore.getInitials(),
-      avatarUrl: userStore.avatarUrl || '',
-      isHost: true,
-      isMuted: false,
-      isCameraOff: false,
-      isScreenSharing: false,
-      isSpeaking: false
-    })
-  }
+  await refreshParticipants(false)
 
   // 3. Demarrer la camera et le micro de l'utilisateur local
   const stream = await media.startMedia()
@@ -194,7 +168,117 @@ onMounted(async () => {
       isSpeaking: !roomStore.isMuted && voiceDetection.isSpeaking.value
     })
   }, 200)
+
+  // 8. Polling des participants toutes les 5s (fallback si Transmit non disponible)
+  participantPollingInterval = setInterval(() => {
+    refreshParticipants(true)
+  }, 5000)
 })
+
+/**
+ * Charge / rafraichit la liste des participants depuis l'API
+ * Si notify=true, affiche une notification pour les nouveaux arrivants
+ */
+async function refreshParticipants(notify) {
+  try {
+    const response = await participantApi.list(props.code)
+    const participantList = response.data || response || []
+    const currentIds = new Set(roomStore.participants.map(p => p.id))
+    let localFound = false
+
+    participantList.forEach(p => {
+      const pId = p.userId || p.id
+      const pName = p.user?.fullName || p.fullName || p.username || 'Participant'
+      const isLocal = pId === localUserId.value
+      if (isLocal) localFound = true
+
+      const existing = roomStore.participants.find(ep => ep.id === pId)
+      if (existing) {
+        // Mettre a jour le nom si manquant
+        if (existing.username === 'Participant' && pName !== 'Participant') {
+          roomStore.updateParticipant(pId, { username: pName })
+        }
+        return
+      }
+
+      // Nouveau participant detecte
+      roomStore.addParticipant({
+        id: pId,
+        username: isLocal ? userStore.username : pName,
+        avatar: (isLocal ? userStore.username : pName).split(' ').map(w => w[0]).slice(0, 2).join('').toUpperCase(),
+        avatarUrl: isLocal ? (userStore.avatarUrl || '') : (p.user?.avatarUrl || p.avatarUrl || ''),
+        isHost: p.role === 'host',
+        isMuted: false,
+        isCameraOff: !isLocal && p.videoEnabled === false,
+        isScreenSharing: false,
+        isSpeaking: false
+      })
+
+      // Notification pour les nouveaux participants (sauf au chargement initial)
+      if (notify && !isLocal) {
+        showToast(`${pName} a rejoint la reunion`)
+        notifSound.playJoin()
+      }
+    })
+
+    // Detecter les participants qui ont quitte (present localement mais plus dans l'API)
+    if (notify) {
+      const apiIds = new Set(participantList.map(p => p.userId || p.id))
+      for (const id of currentIds) {
+        if (id !== localUserId.value && !apiIds.has(id)) {
+          const left = roomStore.participants.find(p => p.id === id)
+          if (left) {
+            showToast(`${left.username} a quitte la reunion`)
+            notifSound.playLeave()
+          }
+          roomStore.removeParticipant(id)
+          delete videoStreams[id]
+        }
+      }
+    }
+
+    // Toujours s'assurer que l'utilisateur local est present
+    if (!localFound) {
+      roomStore.addParticipant({
+        id: localUserId.value,
+        username: userStore.username,
+        avatar: userStore.getInitials(),
+        avatarUrl: userStore.avatarUrl || '',
+        isHost: true,
+        isMuted: false,
+        isCameraOff: false,
+        isScreenSharing: false,
+        isSpeaking: false
+      })
+    }
+  } catch {
+    // Premiere fois et erreur : ajouter au moins le local
+    if (!roomStore.participants.find(p => p.id === localUserId.value)) {
+      roomStore.addParticipant({
+        id: localUserId.value,
+        username: userStore.username,
+        avatar: userStore.getInitials(),
+        avatarUrl: userStore.avatarUrl || '',
+        isHost: true,
+        isMuted: false,
+        isCameraOff: false,
+        isScreenSharing: false,
+        isSpeaking: false
+      })
+    }
+  }
+}
+
+/**
+ * Affiche un toast de notification temporaire
+ */
+function showToast(message) {
+  toastMessage.value = message
+  if (toastTimeout) clearTimeout(toastTimeout)
+  toastTimeout = setTimeout(() => {
+    toastMessage.value = ''
+  }, 4000)
+}
 
 // --- Connexion Transmit (evenements temps reel) ---
 async function initSignaling() {
@@ -351,6 +435,8 @@ onUnmounted(async () => {
   voiceDetection.stop()
   media.stopMedia()
   if (speakingInterval) clearInterval(speakingInterval)
+  if (participantPollingInterval) clearInterval(participantPollingInterval)
+  if (toastTimeout) clearTimeout(toastTimeout)
   // Nettoyer mediasoup (fermer transports, producers, consumers)
   mediasoup.cleanup()
   // Deconnecter le signaling Transmit
@@ -518,6 +604,36 @@ function leaveRoom() {
     padding: 12px;
     overflow: auto;
   }
+
+  &__toast {
+    position: fixed;
+    top: 16px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: rgba($ci-green, 0.9);
+    color: #FFF;
+    padding: 10px 24px;
+    border-radius: $radius-md;
+    font-size: 13px;
+    font-weight: 600;
+    z-index: 1000;
+    backdrop-filter: blur(8px);
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+  }
+}
+
+// Toast animation
+.toast-enter-active,
+.toast-leave-active {
+  transition: all 0.3s ease;
+}
+.toast-enter-from {
+  opacity: 0;
+  transform: translateX(-50%) translateY(-20px);
+}
+.toast-leave-to {
+  opacity: 0;
+  transform: translateX(-50%) translateY(-20px);
 }
 
 // --- Responsive : panneau lateral en overlay mobile ---
