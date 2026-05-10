@@ -199,7 +199,8 @@ export async function produceScreen(track) {
 }
 
 /**
- * Consomme un producer distant (recevoir le media d'un autre participant)
+ * Consomme un producer distant (recevoir le media d'un autre participant).
+ * Le backend retourne { id, producerId, kind, rtpParameters, type, producerPaused }.
  */
 export async function consume(roomCode, producerId) {
   if (!recvTransport) throw new Error('Recv transport non initialise')
@@ -214,7 +215,7 @@ export async function consume(roomCode, producerId) {
 
   const consumer = await recvTransport.consume({
     id: consumerInfo.id,
-    producerId: consumerInfo.producerId,
+    producerId: consumerInfo.producerId || producerId,
     kind: consumerInfo.kind,
     rtpParameters: consumerInfo.rtpParameters
   })
@@ -229,6 +230,21 @@ export async function consume(roomCode, producerId) {
   })
 
   return consumer
+}
+
+/**
+ * Ferme un consumer par son producerId distant
+ * (utilise quand le backend signale rtc:producer-closed)
+ */
+export function closeConsumerByProducerId(producerId) {
+  for (const [id, consumer] of consumers) {
+    if (consumer.producerId === producerId) {
+      consumer.close()
+      consumers.delete(id)
+      return id
+    }
+  }
+  return null
 }
 
 /**

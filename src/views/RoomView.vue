@@ -84,7 +84,7 @@ import { useMediaStream } from '@/composables/useMediaStream'
 import { useVoiceDetection } from '@/composables/useVoiceDetection'
 import { useNotificationSound } from '@/composables/useNotificationSound'
 import { useAuthStore } from '@/stores/auth'
-import { roomApi, participantApi } from '@/services/api'
+import { roomApi, participantApi, rtcApi } from '@/services/api'
 import { signalingService } from '@/services/socket'
 import * as mediasoup from '@/services/mediasoup'
 import RoomHeader from '@/components/room/RoomHeader.vue'
@@ -298,16 +298,21 @@ function showToast(message) {
 }
 
 // --- Connexion Transmit (evenements temps reel) ---
+// Tous les events backend sont broadcast sur `rooms/:code/events`
+// avec la forme { event: 'xxx:yyy', payload: {...} }
 async function initSignaling() {
   try {
     await signalingService.connect(props.code, userStore.username)
 
     // Un participant rejoint la room
-    signalingService.on('participant-joined', (data) => {
+    signalingService.on('participant:joined', (data) => {
+      const userId = data.userId
+      if (userId === localUserId.value) return
+      const name = data.name || 'Participant'
       roomStore.addParticipant({
-        id: data.userId || data.id,
-        username: data.fullName || data.username || 'Participant',
-        avatar: (data.fullName || data.username || 'P').split(' ').map(w => w[0]).slice(0, 2).join('').toUpperCase(),
+        id: userId,
+        username: name,
+        avatar: name.split(' ').map(w => w[0]).slice(0, 2).join('').toUpperCase(),
         avatarUrl: data.avatarUrl || '',
         isHost: data.role === 'host',
         isMuted: false,
@@ -315,47 +320,90 @@ async function initSignaling() {
         isScreenSharing: false,
         isSpeaking: false
       })
+      showToast(`${name} a rejoint la reunion`)
       notifSound.playJoin?.()
     })
 
+    // Un participant invite (mais pas encore connecte) — meme handler que joined
+    signalingService.on('participant:added', (data) => {
+      const userId = data.userId
+      if (userId === localUserId.value) return
+      const name = data.name || 'Participant'
+      if (!roomStore.participants.find(p => p.id === userId)) {
+        roomStore.addParticipant({
+          id: userId,
+          username: name,
+          avatar: name.split(' ').map(w => w[0]).slice(0, 2).join('').toUpperCase(),
+          avatarUrl: '',
+          isHost: data.role === 'host',
+          isMuted: false,
+          isCameraOff: false,
+          isScreenSharing: false,
+          isSpeaking: false
+        })
+      }
+    })
+
     // Un participant quitte la room
-    signalingService.on('participant-left', (data) => {
-      const participantId = data.userId || data.id
-      roomStore.removeParticipant(participantId)
-      // Supprimer son stream video
-      delete videoStreams[participantId]
+    signalingService.on('participant:left', (data) => {
+      const userId = data.userId
+      if (userId === localUserId.value) return
+      const left = roomStore.participants.find(p => p.id === userId)
+      roomStore.removeParticipant(userId)
+      delete videoStreams[userId]
+      if (left) showToast(`${left.username} a quitte la reunion`)
       notifSound.playLeave?.()
     })
 
+    // Un participant kicke
+    signalingService.on('participant:removed', (data) => {
+      const userId = data.userId
+      roomStore.removeParticipant(userId)
+      delete videoStreams[userId]
+    })
+
     // Un participant change son etat media (mute, camera off, etc.)
-    signalingService.on('media-state', (data) => {
-      roomStore.updateParticipant(data.userId || data.id, {
-        isMuted: data.isMuted,
-        isCameraOff: data.isCameraOff,
-        isScreenSharing: data.isScreenSharing
+    signalingService.on('participant:media-state', (data) => {
+      const userId = data.userId
+      if (userId === localUserId.value) return
+      roomStore.updateParticipant(userId, {
+        isMuted: !!data.isMuted,
+        isCameraOff: !!data.isCameraOff,
+        isScreenSharing: !!data.isScreenSharing
       })
     })
 
-    // Nouveau message chat recu
-    signalingService.on('chat-message', (data) => {
+    // Room fermee par l'hote
+    signalingService.on('room:closed', () => {
+      showToast('La room a ete fermee par l\'hote')
+      setTimeout(() => router.push({ name: 'home' }), 1500)
+    })
+
+    // Nouveau message chat
+    signalingService.on('chat:message', (data) => {
       // Ne pas ajouter les messages envoyes par nous-meme
-      if ((data.senderId || data.userId) === localUserId.value) return
+      if (data.senderId === localUserId.value) return
       chatStore.addMessage({
-        senderId: data.senderId || data.userId,
-        senderName: data.senderName || data.fullName || 'Participant',
-        content: data.content || data.message
+        senderId: data.senderId,
+        senderName: data.senderName || 'Participant',
+        content: data.content
       })
-      notifSound.playMessage()
+      notifSound.playMessage?.()
     })
 
-    // Nouveau producer mediasoup disponible (un participant publie un flux)
-    signalingService.on('new-producer', async (data) => {
-      await consumeRemoteProducer(data.producerId, data.userId)
+    // Nouveau producer mediasoup disponible
+    signalingService.on('rtc:new-producer', async (data) => {
+      // On ne consomme pas nos propres flux
+      if (data.userId === localUserId.value) return
+      if (consumedProducerIds.has(data.producerId)) return
+      consumedProducerIds.add(data.producerId)
+      await consumeRemoteProducer(data.producerId, data.userId, data.kind)
     })
 
-    // Un producer mediasoup est ferme
-    signalingService.on('producer-closed', (data) => {
-      mediasoup.closeConsumer(data.consumerId)
+    // Un producer distant a ete ferme
+    signalingService.on('rtc:producer-closed', (data) => {
+      consumedProducerIds.delete(data.producerId)
+      mediasoup.closeConsumerByProducerId(data.producerId)
     })
   } catch (err) {
     console.warn('[Room] Erreur connexion signaling:', err.message)
@@ -398,48 +446,59 @@ async function consumeExistingProducers() {
 }
 
 /**
- * Polle les producers distants et consomme ceux qu'on n'a pas encore consommes
+ * Polle les producers distants et consomme ceux qu'on n'a pas encore consommes.
+ * Le backend renvoie une liste { producerId, kind, participantId, userId, appData },
+ * filtree pour exclure les producers de l'utilisateur courant.
  */
 async function pollRemoteProducers() {
   try {
-    const response = await import('@/services/api').then(m => m.rtcApi.getProducers(props.code))
+    const response = await rtcApi.getProducers(props.code)
     const producerList = response.data || response || []
 
     for (const producer of producerList) {
-      const producerId = producer.id || producer.producerId
-      // Ignorer les producers deja consommes
+      const producerId = producer.producerId
+      const userId = producer.userId
+      if (!producerId || !userId) continue
+      if (userId === localUserId.value) continue
       if (consumedProducerIds.has(producerId)) continue
-      // Ignorer nos propres producers
-      if (producer.userId === localUserId.value) continue
 
       consumedProducerIds.add(producerId)
-      await consumeRemoteProducer(producerId, producer.userId)
+      await consumeRemoteProducer(producerId, userId, producer.kind)
     }
   } catch {
     // Silencieux — le polling reessaiera
   }
 }
 
-// --- Consommer un producer distant et attacher le stream ---
-async function consumeRemoteProducer(producerId, userId) {
+/**
+ * Consomme un producer distant et attache son track au MediaStream
+ * du participant proprietaire (un seul stream par participant, audio + video).
+ */
+async function consumeRemoteProducer(producerId, userId, kind) {
   try {
     const consumer = await mediasoup.consume(props.code, producerId)
-    const { track } = consumer
+    const track = consumer.track
 
-    // Creer ou mettre a jour le MediaStream du participant
-    if (!videoStreams[userId]) {
-      videoStreams[userId] = new MediaStream()
+    // Garantir un MediaStream par participant
+    let stream = videoStreams[userId]
+    if (!(stream instanceof MediaStream)) {
+      stream = new MediaStream()
     }
 
-    // Si c'est un MediaStream existant, ajouter le track
-    const existingStream = videoStreams[userId]
-    if (existingStream instanceof MediaStream) {
-      existingStream.addTrack(track)
-    } else {
-      videoStreams[userId] = new MediaStream([track])
+    // Si on avait deja un track de meme kind, le remplacer
+    const existingTracks = kind === 'audio' ? stream.getAudioTracks() : stream.getVideoTracks()
+    for (const t of existingTracks) {
+      stream.removeTrack(t)
     }
+    stream.addTrack(track)
+
+    // Forcer la reactivite : Vue ne detecte pas les mutations internes
+    // d'une instance de MediaStream, on remplace l'entree dans l'objet reactif.
+    videoStreams[userId] = new MediaStream(stream.getTracks())
   } catch (err) {
     console.warn('[Room] Erreur consume producer:', err.message)
+    // Permettre une nouvelle tentative au prochain polling
+    consumedProducerIds.delete(producerId)
   }
 }
 

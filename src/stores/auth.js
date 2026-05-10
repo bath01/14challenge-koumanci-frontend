@@ -92,6 +92,7 @@ export const useAuthStore = defineStore('auth', () => {
 
   /**
    * Recupere le profil de l'utilisateur connecte
+   * et synchronise le user store local (nom + avatar serveur).
    */
   async function fetchProfile() {
     if (!token.value) return null
@@ -100,10 +101,22 @@ export const useAuthStore = defineStore('auth', () => {
       const response = await accountApi.getProfile()
       const profile = response.data || response
       user.value = profile
-      // Synchroniser le nom avec le user store
       const userStore = useUserStore()
       if (profile.fullName) {
         userStore.setUsername(profile.fullName)
+      }
+      // L'avatar serveur fait foi (les autres clients voient cette valeur).
+      // S'il n'y a rien cote serveur mais un avatar local, on push le local au serveur.
+      if (profile.avatarUrl) {
+        userStore.syncAvatarFromServer(profile.avatarUrl)
+      } else if (userStore.avatarUrl) {
+        try {
+          const updated = await accountApi.updateProfile({ avatarUrl: userStore.avatarUrl })
+          const u = updated.data || updated
+          user.value = { ...user.value, avatarUrl: u.avatarUrl }
+        } catch {
+          // Silencieux : l'avatar reste local si le push echoue
+        }
       }
       return profile
     } catch (err) {
