@@ -81,7 +81,7 @@
       </div>
 
       <!-- Boutons -->
-      <div class="prejoin__actions">
+      <div v-if="!isWaiting" class="prejoin__actions">
         <!-- Erreur -->
         <div v-if="errorMsg" class="prejoin__error">{{ errorMsg }}</div>
 
@@ -92,6 +92,21 @@
         </button>
         <button class="prejoin__btn-back" @click="goBack">
           <ArrowLeft :size="14" /> Retour
+        </button>
+      </div>
+
+      <!-- Ecran salle d'attente -->
+      <div v-else class="prejoin__lobby">
+        <div class="prejoin__lobby-dots">
+          <span /><span /><span />
+        </div>
+        <p class="prejoin__lobby-title">En attente d'approbation</p>
+        <p class="prejoin__lobby-hint">
+          L'hôte doit vous admettre pour que vous puissiez rejoindre la réunion.
+        </p>
+        <div v-if="lobbyError" class="prejoin__error">{{ lobbyError }}</div>
+        <button class="prejoin__btn-back" @click="cancelWaiting">
+          <ArrowLeft :size="14" /> Annuler
         </button>
       </div>
     </div>
@@ -110,6 +125,7 @@ import { useAuthStore } from '@/stores/auth'
 import { useMediaStream } from '@/composables/useMediaStream'
 import { useVoiceDetection } from '@/composables/useVoiceDetection'
 import { roomApi } from '@/services/api'
+import { subscribeToRoomEvents } from '@/services/transmit'
 import FlagBar from '@/components/common/FlagBar.vue'
 
 const props = defineProps({
@@ -129,6 +145,11 @@ const joining = ref(false)
 const roomInfo = ref(null)
 const errorMsg = ref('')
 const avatarGradient = 'linear-gradient(135deg, #FF8C00, #009E49)'
+
+// Salle d'attente
+const isWaiting = ref(false)
+const lobbyError = ref('')
+let unsubscribeLobby = null
 
 onMounted(async () => {
   if (!userStore.username) {
@@ -163,6 +184,7 @@ watch(
 onUnmounted(() => {
   voiceDetection.stop()
   media.stopMedia()
+  unsubscribeLobby?.()
 })
 
 async function handleToggleCamera() {
@@ -186,9 +208,17 @@ async function joinRoom() {
   errorMsg.value = ''
 
   try {
-    // Appeler l'API pour rejoindre la room
-    await roomApi.join(props.code)
-    // Stopper les streams ici, RoomView les redemarre
+    const response = await roomApi.join(props.code)
+    const participant = response.data || response
+
+    // Si le backend place l'utilisateur en salle d'attente
+    if (participant.status === 'waiting') {
+      joining.value = false
+      await enterLobby()
+      return
+    }
+
+    // Acces direct : stopper les streams, RoomView les redemarre
     voiceDetection.stop()
     media.stopMedia()
     router.push({ name: 'room', params: { code: props.code } })
@@ -196,6 +226,74 @@ async function joinRoom() {
     errorMsg.value = err.message || 'Impossible de rejoindre la reunion'
     joining.value = false
   }
+}
+
+/**
+ * Place l'utilisateur en mode salle d'attente et s'abonne aux events SSE
+ * pour recevoir la decision de l'hôte (admitted / rejected).
+ */
+async function enterLobby() {
+  isWaiting.value = true
+  lobbyError.value = ''
+
+  // Recuperer le vrai user ID pour filtrer les events
+  if (!authStore.user?.id) {
+    await authStore.fetchProfile().catch(() => {})
+  }
+  const myUserId = authStore.user?.id
+
+  try {
+    unsubscribeLobby = await subscribeToRoomEvents(props.code, (data) => {
+      const { event, payload } = data
+
+      if (event === 'participant:admitted' && payload.userId === myUserId) {
+        // L'hôte nous a admis — entrer dans la room
+        unsubscribeLobby?.()
+        unsubscribeLobby = null
+        voiceDetection.stop()
+        media.stopMedia()
+        router.push({ name: 'room', params: { code: props.code } })
+      }
+
+      if (event === 'participant:rejected' && payload.userId === myUserId) {
+        // L'hôte nous a refusé — afficher le message et rester sur la page
+        unsubscribeLobby?.()
+        unsubscribeLobby = null
+        isWaiting.value = false
+        errorMsg.value = "L'hôte a refusé votre demande d'accès."
+      }
+    })
+  } catch {
+    // SSE indisponible : polling toutes les 3s sur le statut du participant
+    lobbyError.value = "Connexion temps réel indisponible — vérification périodique en cours..."
+    const interval = setInterval(async () => {
+      if (!isWaiting.value) { clearInterval(interval); return }
+      try {
+        const response = await roomApi.join(props.code)
+        const p = response.data || response
+        if (p.status === 'joined') {
+          clearInterval(interval)
+          voiceDetection.stop()
+          media.stopMedia()
+          router.push({ name: 'room', params: { code: props.code } })
+        } else if (p.status === 'rejected') {
+          clearInterval(interval)
+          isWaiting.value = false
+          errorMsg.value = "L'hôte a refusé votre demande d'accès."
+        }
+      } catch { /* reessaiera au prochain tick */ }
+    }, 3000)
+  }
+}
+
+/**
+ * Annule la demande et retourne a l'ecran de pre-join
+ */
+async function cancelWaiting() {
+  unsubscribeLobby?.()
+  unsubscribeLobby = null
+  isWaiting.value = false
+  try { await roomApi.leave(props.code) } catch { /* ignore */ }
 }
 
 function goBack() {
@@ -469,11 +567,56 @@ function goBack() {
     justify-content: center;
     gap: 6px;
   }
+
+  // --- Salle d'attente ---
+  &__lobby {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 14px;
+    padding: 24px 0 8px;
+    text-align: center;
+  }
+
+  &__lobby-dots {
+    display: flex;
+    gap: 8px;
+
+    span {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: $ci-orange;
+      animation: lobby-pulse 1.2s ease-in-out infinite;
+
+      &:nth-child(2) { animation-delay: 0.2s; }
+      &:nth-child(3) { animation-delay: 0.4s; }
+    }
+  }
+
+  &__lobby-title {
+    font-size: 16px;
+    font-weight: 700;
+    color: $text-primary;
+    margin: 0;
+  }
+
+  &__lobby-hint {
+    font-size: 12px;
+    color: $text-secondary;
+    margin: 0;
+    line-height: 1.5;
+  }
 }
 
 @keyframes audio-bounce {
   0% { height: 6px; }
   100% { height: 20px; }
+}
+
+@keyframes lobby-pulse {
+  0%, 100% { opacity: 0.3; transform: scale(0.8); }
+  50% { opacity: 1; transform: scale(1.2); }
 }
 
 @media (max-width: $bp-tablet) {

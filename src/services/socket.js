@@ -1,7 +1,7 @@
-// Service de signaling temps reel
-// Utilise @adonisjs/transmit-client (SSE) pour recevoir les evenements serveur
-// et des requetes HTTP REST pour envoyer des donnees client -> serveur
-import { subscribeToRoom, unsubscribeFromRoom } from '@/services/transmit'
+// Service de signaling temps reel.
+// Reception via Transmit (SSE) sur le canal unique `rooms/:code/events`,
+// envoi via REST (chat, media-state) car SSE est unidirectionnel.
+import { subscribeToRoomEvents } from '@/services/transmit'
 
 const API_BASE = import.meta.env.VITE_API_URL || '/api/v1'
 
@@ -13,10 +13,9 @@ function getAuthToken() {
 }
 
 /**
- * Envoie un message au serveur via HTTP POST (client -> serveur)
- * Transmit est unidirectionnel (SSE), donc on utilise REST pour l'envoi
+ * POST JSON authentifie sur l'API backend
  */
-async function sendToServer(endpoint, data = {}) {
+async function postJson(endpoint, data = {}) {
   const token = getAuthToken()
   const response = await fetch(`${API_BASE}${endpoint}`, {
     method: 'POST',
@@ -28,8 +27,6 @@ async function sendToServer(endpoint, data = {}) {
   })
 
   if (!response.ok) {
-    // Ignorer silencieusement les 404 (endpoint pas encore cree cote backend)
-    if (response.status === 404) return null
     const body = await response.json().catch(() => ({}))
     throw new Error(body.errors?.[0]?.message || body.message || 'Erreur serveur')
   }
@@ -39,57 +36,41 @@ async function sendToServer(endpoint, data = {}) {
 }
 
 /**
- * Service de signaling qui combine Transmit (reception) et REST (envoi)
+ * Service de signaling : combine Transmit (reception) et REST (envoi).
+ * Les events emis par le backend ont la forme { event, payload } et sont
+ * dispatches aux listeners via la cle `event` (ex: 'participant:joined').
  */
 export class SignalingService {
   constructor() {
     this.roomCode = null
     this.username = null
     this.listeners = new Map()
-    this.unsubscribeRoom = null
+    this.unsubscribe = null
   }
 
   /**
-   * Se connecte a une room : s'abonne aux canaux Transmit
+   * Se connecte a une room : s'abonne au canal Transmit `rooms/:code/events`
    */
   async connect(roomCode, username) {
     this.roomCode = roomCode
     this.username = username
 
-    // S'abonner aux canaux Transmit de la room
-    this.unsubscribeRoom = await subscribeToRoom(roomCode, {
-      // Evenements de la room (lock, settings, etc.)
-      onRoomEvent: (data) => {
-        this._dispatch(data.type || 'room-event', data.payload || data)
-      },
-
-      // Messages chat
-      onChatMessage: (data) => {
-        this._dispatch('chat-message', data)
-      },
-
-      // Evenements participants (join, leave, media-state)
-      onParticipantEvent: (data) => {
-        this._dispatch(data.type || 'participant-event', data.payload || data)
-      },
-
-      // Signaling mediasoup (new-producer, producer-closed, etc.)
-      onSignaling: (data) => {
-        this._dispatch(data.type || 'signaling', data.payload || data)
-      }
+    this.unsubscribe = await subscribeToRoomEvents(roomCode, (data) => {
+      // Le backend broadcast { event: 'xxx:yyy', payload: {...} }
+      const eventName = data?.event
+      const payload = data?.payload ?? data
+      if (!eventName) return
+      this._dispatch(eventName, payload)
     })
   }
 
   /**
-   * Se deconnecte de la room
+   * Se deconnecte du canal Transmit de la room
    */
   async disconnect() {
-    if (this.unsubscribeRoom) {
-      await this.unsubscribeRoom()
-      this.unsubscribeRoom = null
-    }
-    if (this.roomCode) {
-      await unsubscribeFromRoom(this.roomCode)
+    if (this.unsubscribe) {
+      await this.unsubscribe()
+      this.unsubscribe = null
     }
     this.roomCode = null
     this.username = null
@@ -97,16 +78,7 @@ export class SignalingService {
   }
 
   /**
-   * Envoie un message au serveur via REST
-   * Silencieux si l'endpoint n'existe pas encore cote backend
-   */
-  send(type, payload) {
-    if (!this.roomCode) return
-    return sendToServer(`/rooms/${this.roomCode}/signal`, { type, payload }).catch(() => {})
-  }
-
-  /**
-   * Ecoute un type d'evenement
+   * Ecoute un type d'evenement (ex: 'participant:joined', 'rtc:new-producer')
    */
   on(type, handler) {
     if (!this.listeners.has(type)) {
@@ -121,44 +93,36 @@ export class SignalingService {
   off(type, handler) {
     const handlers = this.listeners.get(type)
     if (handlers) {
-      this.listeners.set(type, handlers.filter(h => h !== handler))
+      this.listeners.set(type, handlers.filter((h) => h !== handler))
     }
   }
 
   /**
-   * Dispatch un evenement a tous les listeners
+   * Dispatch un evenement a tous les listeners enregistres
    */
   _dispatch(type, data) {
     const handlers = this.listeners.get(type) || []
-    handlers.forEach(handler => handler(data))
+    handlers.forEach((handler) => handler(data))
   }
 
-  // --- Signaling WebRTC (envoi via REST) ---
+  // --- Envois client -> serveur via REST ---
 
-  sendOffer(targetId, offer) {
-    return this.send('offer', { targetId, offer })
+  /**
+   * Envoie un message chat dans la room courante.
+   * Le backend rebroadcast sur le canal events avec event=chat:message.
+   */
+  async sendChatMessage(content) {
+    if (!this.roomCode) return null
+    return postJson(`/rooms/${this.roomCode}/chat`, { content })
   }
 
-  sendAnswer(targetId, answer) {
-    return this.send('answer', { targetId, answer })
-  }
-
-  sendIceCandidate(targetId, candidate) {
-    return this.send('ice-candidate', { targetId, candidate })
-  }
-
-  sendMediaState(state) {
-    return this.send('media-state', state)
-  }
-
-  // --- Chat (envoi via REST) ---
-
-  sendChatMessage(content) {
-    return sendToServer(`/rooms/${this.roomCode}/chat`, { content }).catch(() => {})
-  }
-
-  sendTyping() {
-    return this.send('chat-typing', {})
+  /**
+   * Notifie le serveur du nouvel etat media local (mute/camera/screen).
+   * Le backend rebroadcast avec event=participant:media-state.
+   */
+  async sendMediaState(state) {
+    if (!this.roomCode) return null
+    return postJson(`/rooms/${this.roomCode}/media-state`, state)
   }
 }
 

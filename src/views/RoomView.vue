@@ -7,6 +7,30 @@
       </div>
     </Transition>
 
+    <!-- Notifications de salle d'attente (hote seulement) -->
+    <div v-if="waitingQueue.length > 0" class="room__lobby-queue">
+      <div
+        v-for="req in waitingQueue"
+        :key="req.userId"
+        class="room__lobby-card"
+      >
+        <div class="room__lobby-avatar">
+          <img v-if="req.avatarUrl" :src="req.avatarUrl" />
+          <span v-else>{{ req.name.split(' ').map(w => w[0]).slice(0, 2).join('').toUpperCase() }}</span>
+        </div>
+        <div class="room__lobby-info">
+          <p class="room__lobby-name">{{ req.name }}</p>
+          <p class="room__lobby-hint">demande a rejoindre</p>
+        </div>
+        <button class="room__lobby-btn room__lobby-btn--admit" @click="admitWaiting(req.userId)" :disabled="req.loading">
+          Admettre
+        </button>
+        <button class="room__lobby-btn room__lobby-btn--reject" @click="rejectWaiting(req.userId)" :disabled="req.loading">
+          Refuser
+        </button>
+      </div>
+    </div>
+
     <!-- Header -->
     <RoomHeader
       :room-code="code"
@@ -84,7 +108,7 @@ import { useMediaStream } from '@/composables/useMediaStream'
 import { useVoiceDetection } from '@/composables/useVoiceDetection'
 import { useNotificationSound } from '@/composables/useNotificationSound'
 import { useAuthStore } from '@/stores/auth'
-import { roomApi, participantApi } from '@/services/api'
+import { roomApi, participantApi, rtcApi } from '@/services/api'
 import { signalingService } from '@/services/socket'
 import * as mediasoup from '@/services/mediasoup'
 import RoomHeader from '@/components/room/RoomHeader.vue'
@@ -114,13 +138,17 @@ const videoStreams = reactive({})
 let speakingInterval = null
 let participantPollingInterval = null
 let producerPollingInterval = null
-// ID de l'utilisateur local (depuis le profil auth)
-const localUserId = ref(authStore.user?.id || 1)
+// ID de l'utilisateur local — initialisé après fetchProfile dans onMounted
+const localUserId = ref(0)
 // Set des producers deja consommes pour eviter les doublons
 const consumedProducerIds = new Set()
+// Vrai quand recvTransport est pret — garde les rtc:new-producer precoces
+let mediasoupReady = false
 // Toast de notification
 const toastMessage = ref('')
 let toastTimeout = null
+// File d'attente de la salle d'attente (hote seulement)
+const waitingQueue = ref([])
 
 // --- Initialisation de la room ---
 onMounted(async () => {
@@ -129,6 +157,12 @@ onMounted(async () => {
     router.push({ name: 'home' })
     return
   }
+
+  // 0. Charger le profil pour obtenir le vrai user ID avant tout filtrage SSE
+  if (!authStore.user?.id) {
+    await authStore.fetchProfile().catch(() => {})
+  }
+  localUserId.value = authStore.user?.id ?? 0
 
   // 1. S'assurer qu'on est bien enregistre dans la room cote backend
   try {
@@ -154,7 +188,7 @@ onMounted(async () => {
   // 3. Charger les participants depuis l'API
   await refreshParticipants(false)
 
-  // 3. Demarrer la camera et le micro de l'utilisateur local
+  // 4. Demarrer la camera et le micro de l'utilisateur local
   const stream = await media.startMedia()
   if (stream) {
     videoStreams[localUserId.value] = stream
@@ -163,15 +197,14 @@ onMounted(async () => {
     voiceDetection.start(stream)
   }
 
-  // 4. Connecter Transmit (SSE) pour recevoir les evenements temps reel
-  // Non bloquant : si Transmit n'est pas configure, le polling prend le relais
-  initSignaling().catch(() => {})
+  // 5. S'abonner aux SSE en premier — les handlers doivent etre prets
+  // avant qu'on cree nos producers (qui declenchent rtc:new-producer cote serveur)
+  await initSignaling().catch((err) => console.warn('[Room] Signaling:', err.message))
 
-  // 5. Initialiser mediasoup (WebRTC SFU) pour le streaming
-  // Non bloquant : si mediasoup n'est pas pret, le polling des producers prend le relais
-  initMediasoup(stream).catch(() => {})
+  // 6. Initialiser mediasoup apres que les listeners SSE sont en place
+  initMediasoup(stream).catch((err) => console.warn('[Room] Mediasoup:', err.message))
 
-  // 6. Demarrer le timer d'appel
+  // 7. Demarrer le timer d'appel
   callTimer.start()
 
   // 7. Mettre a jour l'indicateur de parole local
@@ -298,16 +331,21 @@ function showToast(message) {
 }
 
 // --- Connexion Transmit (evenements temps reel) ---
+// Tous les events backend sont broadcast sur `rooms/:code/events`
+// avec la forme { event: 'xxx:yyy', payload: {...} }
 async function initSignaling() {
   try {
     await signalingService.connect(props.code, userStore.username)
 
     // Un participant rejoint la room
-    signalingService.on('participant-joined', (data) => {
+    signalingService.on('participant:joined', (data) => {
+      const userId = data.userId
+      if (userId === localUserId.value) return
+      const name = data.name || 'Participant'
       roomStore.addParticipant({
-        id: data.userId || data.id,
-        username: data.fullName || data.username || 'Participant',
-        avatar: (data.fullName || data.username || 'P').split(' ').map(w => w[0]).slice(0, 2).join('').toUpperCase(),
+        id: userId,
+        username: name,
+        avatar: name.split(' ').map(w => w[0]).slice(0, 2).join('').toUpperCase(),
         avatarUrl: data.avatarUrl || '',
         isHost: data.role === 'host',
         isMuted: false,
@@ -315,47 +353,133 @@ async function initSignaling() {
         isScreenSharing: false,
         isSpeaking: false
       })
+      showToast(`${name} a rejoint la reunion`)
       notifSound.playJoin?.()
     })
 
+    // Un participant invite (mais pas encore connecte) — meme handler que joined
+    signalingService.on('participant:added', (data) => {
+      const userId = data.userId
+      if (userId === localUserId.value) return
+      const name = data.name || 'Participant'
+      if (!roomStore.participants.find(p => p.id === userId)) {
+        roomStore.addParticipant({
+          id: userId,
+          username: name,
+          avatar: name.split(' ').map(w => w[0]).slice(0, 2).join('').toUpperCase(),
+          avatarUrl: '',
+          isHost: data.role === 'host',
+          isMuted: false,
+          isCameraOff: false,
+          isScreenSharing: false,
+          isSpeaking: false
+        })
+      }
+    })
+
     // Un participant quitte la room
-    signalingService.on('participant-left', (data) => {
-      const participantId = data.userId || data.id
-      roomStore.removeParticipant(participantId)
-      // Supprimer son stream video
-      delete videoStreams[participantId]
+    signalingService.on('participant:left', (data) => {
+      const userId = data.userId
+      if (userId === localUserId.value) return
+      const left = roomStore.participants.find(p => p.id === userId)
+      roomStore.removeParticipant(userId)
+      delete videoStreams[userId]
+      if (left) showToast(`${left.username} a quitte la reunion`)
       notifSound.playLeave?.()
     })
 
+    // Un participant kicke
+    signalingService.on('participant:removed', (data) => {
+      const userId = data.userId
+      roomStore.removeParticipant(userId)
+      delete videoStreams[userId]
+    })
+
     // Un participant change son etat media (mute, camera off, etc.)
-    signalingService.on('media-state', (data) => {
-      roomStore.updateParticipant(data.userId || data.id, {
-        isMuted: data.isMuted,
-        isCameraOff: data.isCameraOff,
-        isScreenSharing: data.isScreenSharing
+    signalingService.on('participant:media-state', (data) => {
+      const userId = data.userId
+      if (userId === localUserId.value) return
+      roomStore.updateParticipant(userId, {
+        isMuted: !!data.isMuted,
+        isCameraOff: !!data.isCameraOff,
+        isScreenSharing: !!data.isScreenSharing
       })
     })
 
-    // Nouveau message chat recu
-    signalingService.on('chat-message', (data) => {
+    // Un participant demande a rejoindre depuis la salle d'attente
+    signalingService.on('participant:waiting', (data) => {
+      // Seul l'hote doit voir et gerer les demandes
+      if (localUserId.value !== roomStore.hostId) return
+      if (waitingQueue.value.find(r => r.userId === data.userId)) return
+      waitingQueue.value.push({
+        userId: data.userId,
+        name: data.name || 'Participant',
+        avatarUrl: data.avatarUrl || '',
+        loading: false
+      })
+    })
+
+    // Un participant a ete admis par l'hote
+    signalingService.on('participant:admitted', (data) => {
+      // Retirer de la file d'attente
+      waitingQueue.value = waitingQueue.value.filter(r => r.userId !== data.userId)
+      // L'ajouter comme participant actif (s'il n'est pas deja present)
+      if (data.userId === localUserId.value) return
+      const name = data.name || 'Participant'
+      if (!roomStore.participants.find(p => p.id === data.userId)) {
+        roomStore.addParticipant({
+          id: data.userId,
+          username: name,
+          avatar: name.split(' ').map(w => w[0]).slice(0, 2).join('').toUpperCase(),
+          avatarUrl: data.avatarUrl || '',
+          isHost: false,
+          isMuted: false,
+          isCameraOff: false,
+          isScreenSharing: false,
+          isSpeaking: false
+        })
+      }
+      showToast(`${name} a rejoint la reunion`)
+      notifSound.playJoin?.()
+    })
+
+    // Un participant a ete refuse par l'hote
+    signalingService.on('participant:rejected', (data) => {
+      waitingQueue.value = waitingQueue.value.filter(r => r.userId !== data.userId)
+    })
+
+    // Room fermee par l'hote
+    signalingService.on('room:closed', () => {
+      showToast('La room a ete fermee par l\'hote')
+      setTimeout(() => router.push({ name: 'home' }), 1500)
+    })
+
+    // Nouveau message chat
+    signalingService.on('chat:message', (data) => {
       // Ne pas ajouter les messages envoyes par nous-meme
-      if ((data.senderId || data.userId) === localUserId.value) return
+      if (data.senderId === localUserId.value) return
       chatStore.addMessage({
-        senderId: data.senderId || data.userId,
-        senderName: data.senderName || data.fullName || 'Participant',
-        content: data.content || data.message
+        senderId: data.senderId,
+        senderName: data.senderName || 'Participant',
+        content: data.content
       })
-      notifSound.playMessage()
+      notifSound.playMessage?.()
     })
 
-    // Nouveau producer mediasoup disponible (un participant publie un flux)
-    signalingService.on('new-producer', async (data) => {
-      await consumeRemoteProducer(data.producerId, data.userId)
+    // Nouveau producer mediasoup disponible
+    signalingService.on('rtc:new-producer', async (data) => {
+      if (data.userId === localUserId.value) return
+      if (consumedProducerIds.has(data.producerId)) return
+      // Si recvTransport n'est pas encore pret, le polling des producers prend le relais
+      if (!mediasoupReady) return
+      consumedProducerIds.add(data.producerId)
+      await consumeRemoteProducer(data.producerId, data.userId, data.kind)
     })
 
-    // Un producer mediasoup est ferme
-    signalingService.on('producer-closed', (data) => {
-      mediasoup.closeConsumer(data.consumerId)
+    // Un producer distant a ete ferme
+    signalingService.on('rtc:producer-closed', (data) => {
+      consumedProducerIds.delete(data.producerId)
+      mediasoup.closeConsumerByProducerId(data.producerId)
     })
   } catch (err) {
     console.warn('[Room] Erreur connexion signaling:', err.message)
@@ -387,6 +511,9 @@ async function initMediasoup(localStream) {
 
     // Consommer les producers existants (participants deja dans la room)
     await consumeExistingProducers()
+
+    // recvTransport est pret — les rtc:new-producer suivants seront traites directement
+    mediasoupReady = true
   } catch (err) {
     console.warn('[Room] Erreur init mediasoup:', err.message)
   }
@@ -398,48 +525,59 @@ async function consumeExistingProducers() {
 }
 
 /**
- * Polle les producers distants et consomme ceux qu'on n'a pas encore consommes
+ * Polle les producers distants et consomme ceux qu'on n'a pas encore consommes.
+ * Le backend renvoie une liste { producerId, kind, participantId, userId, appData },
+ * filtree pour exclure les producers de l'utilisateur courant.
  */
 async function pollRemoteProducers() {
   try {
-    const response = await import('@/services/api').then(m => m.rtcApi.getProducers(props.code))
+    const response = await rtcApi.getProducers(props.code)
     const producerList = response.data || response || []
 
     for (const producer of producerList) {
-      const producerId = producer.id || producer.producerId
-      // Ignorer les producers deja consommes
+      const producerId = producer.producerId
+      const userId = producer.userId
+      if (!producerId || !userId) continue
+      if (userId === localUserId.value) continue
       if (consumedProducerIds.has(producerId)) continue
-      // Ignorer nos propres producers
-      if (producer.userId === localUserId.value) continue
 
       consumedProducerIds.add(producerId)
-      await consumeRemoteProducer(producerId, producer.userId)
+      await consumeRemoteProducer(producerId, userId, producer.kind)
     }
   } catch {
     // Silencieux — le polling reessaiera
   }
 }
 
-// --- Consommer un producer distant et attacher le stream ---
-async function consumeRemoteProducer(producerId, userId) {
+/**
+ * Consomme un producer distant et attache son track au MediaStream
+ * du participant proprietaire (un seul stream par participant, audio + video).
+ */
+async function consumeRemoteProducer(producerId, userId, kind) {
   try {
     const consumer = await mediasoup.consume(props.code, producerId)
-    const { track } = consumer
+    const track = consumer.track
 
-    // Creer ou mettre a jour le MediaStream du participant
-    if (!videoStreams[userId]) {
-      videoStreams[userId] = new MediaStream()
+    // Garantir un MediaStream par participant
+    let stream = videoStreams[userId]
+    if (!(stream instanceof MediaStream)) {
+      stream = new MediaStream()
     }
 
-    // Si c'est un MediaStream existant, ajouter le track
-    const existingStream = videoStreams[userId]
-    if (existingStream instanceof MediaStream) {
-      existingStream.addTrack(track)
-    } else {
-      videoStreams[userId] = new MediaStream([track])
+    // Si on avait deja un track de meme kind, le remplacer
+    const existingTracks = kind === 'audio' ? stream.getAudioTracks() : stream.getVideoTracks()
+    for (const t of existingTracks) {
+      stream.removeTrack(t)
     }
+    stream.addTrack(track)
+
+    // Forcer la reactivite : Vue ne detecte pas les mutations internes
+    // d'une instance de MediaStream, on remplace l'entree dans l'objet reactif.
+    videoStreams[userId] = new MediaStream(stream.getTracks())
   } catch (err) {
     console.warn('[Room] Erreur consume producer:', err.message)
+    // Permettre une nouvelle tentative au prochain polling
+    consumedProducerIds.delete(producerId)
   }
 }
 
@@ -577,16 +715,20 @@ function handleSetView(mode) {
   roomStore.setViewMode(mode)
 }
 
-function handleSendMessage(content) {
-  // Ajouter le message localement
+async function handleSendMessage(content) {
+  // Ajout optimiste local avant la reponse serveur
   chatStore.addMessage({
     senderId: localUserId.value,
     senderName: userStore.username,
     content
   })
-  // Envoyer au serveur via REST (Transmit est unidirectionnel)
-  signalingService.sendChatMessage(content)
   notifSound.playMessage()
+
+  try {
+    await signalingService.sendChatMessage(content)
+  } catch (err) {
+    showToast('Erreur envoi message : ' + (err.message || 'reessaie'))
+  }
 }
 
 function toggleChat() {
@@ -613,6 +755,38 @@ function setActiveTab(tab) {
 
 function leaveRoom() {
   router.push({ name: 'home' })
+}
+
+/**
+ * Admet un participant depuis la salle d'attente
+ */
+async function admitWaiting(userId) {
+  const req = waitingQueue.value.find(r => r.userId === userId)
+  if (!req) return
+  req.loading = true
+  try {
+    await participantApi.admit(props.code, userId)
+    // Le SSE participant:admitted retirera l'entree de la file
+  } catch (err) {
+    showToast('Erreur : ' + (err.message || 'impossible d\'admettre'))
+    req.loading = false
+  }
+}
+
+/**
+ * Refuse un participant depuis la salle d'attente
+ */
+async function rejectWaiting(userId) {
+  const req = waitingQueue.value.find(r => r.userId === userId)
+  if (!req) return
+  req.loading = true
+  try {
+    await participantApi.reject(props.code, userId)
+    // Le SSE participant:rejected retirera l'entree de la file
+  } catch (err) {
+    showToast('Erreur : ' + (err.message || 'impossible de refuser'))
+    req.loading = false
+  }
 }
 </script>
 
@@ -651,6 +825,98 @@ function leaveRoom() {
     z-index: 1000;
     backdrop-filter: blur(8px);
     box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+  }
+
+  // --- File d'attente (salle d'attente, hote seulement) ---
+  &__lobby-queue {
+    position: fixed;
+    bottom: 90px;
+    right: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    z-index: 500;
+    max-width: 340px;
+  }
+
+  &__lobby-card {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    background: $card;
+    border: 1px solid $border;
+    border-radius: $radius-lg;
+    padding: 12px 14px;
+    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.4);
+    backdrop-filter: blur(12px);
+  }
+
+  &__lobby-avatar {
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, $ci-orange, $ci-green);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    overflow: hidden;
+
+    img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+
+    span {
+      font-size: 12px;
+      font-weight: 700;
+      color: #FFF;
+    }
+  }
+
+  &__lobby-info {
+    flex: 1;
+    min-width: 0;
+  }
+
+  &__lobby-name {
+    font-size: 13px;
+    font-weight: 600;
+    color: $text-primary;
+    margin: 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  &__lobby-hint {
+    font-size: 11px;
+    color: $text-dim;
+    margin: 2px 0 0;
+  }
+
+  &__lobby-btn {
+    padding: 6px 12px;
+    border-radius: $radius-md;
+    border: none;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    flex-shrink: 0;
+    transition: opacity 0.15s;
+
+    &:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    &--admit {
+      background: $ci-green;
+      color: #FFF;
+    }
+
+    &--reject {
+      background: $danger;
+      color: #FFF;
+    }
   }
 }
 

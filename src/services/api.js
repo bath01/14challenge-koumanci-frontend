@@ -90,6 +90,17 @@ export const authApi = {
 export const accountApi = {
   getProfile() {
     return request('/account/profile')
+  },
+
+  /**
+   * Met a jour le profil (nom complet et/ou avatar).
+   * @param {{ fullName?: string, avatarUrl?: string|null }} data
+   */
+  updateProfile(data) {
+    return request('/account/profile', {
+      method: 'PUT',
+      body: JSON.stringify(data)
+    })
   }
 }
 
@@ -143,6 +154,14 @@ export const participantApi = {
     return request(`/rooms/${code}/participants/${userId}`, {
       method: 'DELETE'
     })
+  },
+
+  admit(code, userId) {
+    return request(`/rooms/${code}/participants/${userId}/admit`, { method: 'POST' })
+  },
+
+  reject(code, userId) {
+    return request(`/rooms/${code}/participants/${userId}/reject`, { method: 'POST' })
   }
 }
 
